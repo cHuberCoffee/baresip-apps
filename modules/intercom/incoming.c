@@ -109,6 +109,8 @@ static int incoming_handler(const struct pl *name,
 	bool allow_surveil  = false;
 	int err = 0;
 
+	info ("intrcom: incoming_handler: nameptr: %p valptr: %p\n", name, val);
+
 	if (!name || !val)
 		return 0;
 
@@ -275,7 +277,11 @@ void ua_event_handler(struct ua *ua, enum ua_event ev,
 
 	case UA_EVENT_CALL_INCOMING:
 
+		info("intercom: ua_event_handler: INCOMING CALL!\n");
+
 		hdrs = call_get_custom_hdrs(call);
+
+		info("intercom: ua_event_handler: %p\n", hdrs);
 		(void)custom_hdrs_apply(hdrs, incoming_handler, call);
 		break;
 

@@ -360,7 +360,7 @@ static int module_init(void)
 	err |= uag_add_xhdr_intercom();
 	err |= iccustom_init();
 
-	info("intercom: init\n");
+	info("intercom: init (%m)\n", err);
 	return err;
 }
 
