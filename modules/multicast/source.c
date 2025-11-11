@@ -36,8 +36,13 @@ struct mcsource {
 	struct aubuf *aubuf;
 	size_t aubuf_maxsz;
 	volatile bool aubuf_started;
+
+	struct aufile *af_gong;
+	struct aufile_prm prm_gong;
+	bool gong_strm_done;
+
 	struct auresamp resamp;
-	int16_t *sampv_rs;
+	void *sampv_rs;
 	struct list filtl;
 
 	struct mbuf *mb;
@@ -76,6 +81,8 @@ static void mcsource_destructor(void *arg)
 
 	src->ausrc = mem_deref(src->ausrc);
 	src->aubuf = mem_deref(src->aubuf);
+	src->af_gong = mem_deref(src->af_gong);
+
 	list_flush(&src->filtl);
 
 	src->enc      = mem_deref(src->enc);
@@ -89,16 +96,136 @@ static void mcsource_destructor(void *arg)
 
 
 /**
+ * Read and prepare audio file for transmission
+ *
+ * @param af  Audio frame object
+ * @param src Multicast source
+ *
+ * @return 0 if success, otherwise errorcode
+ */
+static int process_aufile(struct auframe *af, struct mcsource *src)
+{
+	size_t n = 0, sampb = 0;
+	int err = 0;
+
+	if (!af || !src)
+		return EINVAL;
+
+	if (src->prm_gong.srate != src->resamp.irate &&
+		src->resamp.irate != 0) {
+		debug("mcsource: resetup resampler for audio file "
+			"(input %d | output %d)\n",
+			src->prm_gong.srate, src->ac->srate);
+		err = auresamp_setup(&src->resamp, src->prm_gong.srate,
+			src->prm_gong.channels, src->ac->srate, src->ac->ch);
+		if (err)
+			return err;
+	}
+
+	sampb = (src->prm_gong.srate * src->prm_gong.channels * PTIME / 1000)
+		* aufmt_sample_size(src->prm_gong.fmt);
+	n = sampb;
+
+	if (n > AUDIO_SAMPSZ * aufmt_sample_size(src->enc_fmt)) {
+		warning ("mcsource: audio sample buffer too small\n");
+		return ENOMEM;
+	}
+
+	/* Temporary read a audio frame for the correct timestamp */
+	aubuf_read_auframe(src->aubuf, af);
+	if (aufile_read(src->af_gong, (uint8_t *)src->sampv, &n) || n == 0) {
+		debug("mcsource: audio file EOF (no silence inserted)\n");
+		src->gong_strm_done = true;
+		src->af_gong = mem_deref(src->af_gong);
+	} else if (n < sampb) {
+		memset((uint8_t *)src->sampv + n , 0, sampb - n);
+		debug("mcsource: audio file EOF\n");
+		src->gong_strm_done = true;
+		src->af_gong = mem_deref(src->af_gong);
+	}
+
+	if (src->resamp.resample) {
+		size_t sampc_rs = AUDIO_SAMPSZ;
+		err = auresamp(&src->resamp,
+			src->sampv_rs, &sampc_rs,
+			src->sampv,
+			(sampb / aufmt_sample_size(src->prm_gong.fmt)));
+		if (err)
+			return err;
+
+		auframe_update(af, src->sampv_rs, sampc_rs,
+			af->timestamp);
+	} else {
+		auframe_update(af, src->sampv,
+			(sampb / aufmt_sample_size(src->prm_gong.fmt)),
+			af->timestamp);
+	}
+
+	return 0;
+}
+
+
+/**
+ * Read and prepare audio source for transmission
+ *
+ * @param af  Audio frame object
+ * @param src Multicast source
+ *
+ * @return 0 if success, otherwise errorcode
+ */
+static int process_mic(struct auframe *af, struct mcsource *src)
+{
+	int err = 0;
+
+	if (src->src_fmt != AUFMT_S16LE || src->enc_fmt != AUFMT_S16LE) {
+		warning ("mcsource: invalid sample formats (%s - %s)\n",
+			aufmt_name(src->src_fmt), aufmt_name(src->enc_fmt));
+		return EINVAL;
+	}
+
+	if (src->ausrc_prm.srate != src->resamp.irate) {
+		debug ("mcsource: resetup resampler for audio source"
+			" (input %d | output %d)\n",
+			src->ausrc_prm.srate, src->ac->srate);
+		err = auresamp_setup(&src->resamp, src->ausrc_prm.srate,
+			src->ausrc_prm.ch, src->ac->srate, src->ac->ch);
+		if (err) {
+			warning ("mcsource: resampler setup for audio source"
+				"failed %m\n", err);
+			return err;
+		}
+	}
+
+	aubuf_read_auframe(src->aubuf, af);
+	if (src->resamp.resample) {
+		size_t sampc_rs = AUDIO_SAMPSZ;
+		err = auresamp(&src->resamp,
+			src->sampv_rs, &sampc_rs,
+			af->sampv, af->sampc);
+
+		if (err) {
+			warning ("mcsource: resampling of audio source failed"
+				" %m\n", err);
+			return err;
+		}
+
+		auframe_update(af, src->sampv_rs, sampc_rs,
+			af->timestamp);
+	}
+
+	return err;
+}
+
+
+/**
  * Encode and send audio data via multicast send handler of src
  *
  * @note This function has REAL-TIME properties
  *
- * @param src   Multicast source object
- * @param sampv Samplebuffer
- * @param sampc Samplecounter
+ * @param src Multicast source object
+ * @param af  Audio frame object
  */
-static void encode_rtp_send(struct mcsource *src, uint16_t *sampv,
-	size_t sampc)
+static void encode_rtp_send(struct mcsource *src, struct auframe *af)
 {
 	size_t frame_size;
 	size_t sampc_rtp;
@@ -115,15 +242,15 @@ static void encode_rtp_send(struct mcsource *src, uint16_t *sampv,
 
 	len = mbuf_get_space(src->mb);
 	err = src->ac->ench(src->enc, &src->marker, mbuf_buf(src->mb), &len,
-		src->enc_fmt, sampv, sampc);
+		src->enc_fmt, af->sampv, af->sampc);
 
 	if ((err & 0xffff0000) == 0x00010000) {
 		ts_delta = err & 0xffff;
-		sampc = 0;
+		af->sampc = 0;
 	}
 	else if (err) {
-		warning ("multicast send: &s encode error: &d samples (%m)\n",
-			src->ac->name, sampc, err);
+		warning ("mcsource: %s encode error: %d samples (%m)\n",
+			src->ac->name, af->sampc, err);
 		goto out;
 	}
 
@@ -146,7 +273,7 @@ static void encode_rtp_send(struct mcsource *src, uint16_t *sampv,
 		}
 	}
 
-	sampc_rtp = sampc * src->ac->crate / src->ac->srate;
+	sampc_rtp = af->sampc * src->ac->crate / src->ac->srate;
 	frame_size = sampc_rtp / src->ac->ch;
 	src->ts_ext += (uint32_t) frame_size;
 
@@ -165,61 +292,17 @@ static void encode_rtp_send(struct mcsource *src, uint16_t *sampv,
 static void poll_aubuf_tx(struct mcsource *src)
 {
 	struct auframe af;
-	int16_t *sampv = src->sampv;
-	size_t sampc;
-	size_t sz;
-	size_t num_bytes;
+	size_t sampc, num_bytes;
 	struct le *le;
 	uint32_t srate;
 	uint8_t ch;
 	int err = 0;
 
-	sz = aufmt_sample_size(src->src_fmt);
-	if (!sz)
+	if (!src)
 		return;
 
 	num_bytes = src->psize;
-	sampc = num_bytes / sz;
-
-	if (src->src_fmt == AUFMT_S16LE) {
-		aubuf_read(src->aubuf, (uint8_t *)sampv, num_bytes);
-	}
-	else if (src->enc_fmt == AUFMT_S16LE) {
-		void *tmp_sampv = NULL;
-
-		tmp_sampv = mem_zalloc(num_bytes, NULL);
-		if (!tmp_sampv)
-			return;
-
-		aubuf_read(src->aubuf, tmp_sampv, num_bytes);
-		auconv_to_s16(sampv, src->src_fmt, tmp_sampv, sampc);
-		mem_deref(tmp_sampv);
-	}
-	else {
-		warning("multicast send: invalid sample formats (%s -> %s)\n",
-			aufmt_name(src->src_fmt),
-			aufmt_name(src->enc_fmt));
-	}
-
-	if (src->resamp.resample) {
-		size_t sampc_rs = AUDIO_SAMPSZ;
-
-		if (src->enc_fmt != AUFMT_S16LE) {
-			warning("multicast send: skipping resampler due to"
-				" incompatible format (%s)\n",
-				aufmt_name(src->enc_fmt));
-			return;
-		}
-
-		err = auresamp(&src->resamp, src->sampv_rs, &sampc_rs,
-			src->sampv, sampc);
-			if (err)
-				return;
-
-		sampv = src->sampv_rs;
-		sampc = sampc_rs;
-	}
-
+	sampc = num_bytes / aufmt_sample_size(src->src_fmt);
 	if (src->resamp.resample) {
 		srate = src->resamp.irate;
 		ch = src->resamp.ich;
@@ -229,20 +312,29 @@ static void poll_aubuf_tx(struct mcsource *src)
 		ch = src->ausrc_prm.ch;
 	}
 
-	auframe_init(&af, src->enc_fmt, sampv, sampc, srate, ch);
+	auframe_init(&af, AUFMT_S16LE, src->sampv, sampc, srate, ch);
+	if (src->af_gong) {
+		err = process_aufile(&af, src);
+		if (err)
+			warning ("mcsource: Error while processing audio file"
+				" %m\n", err);
+	} else {
+		err = process_mic(&af, src);
+		if (err)
+			warning ("mcsource: Error while processing mic data"
+				" %m\n", err);
+	}
 
-	/* process exactly one audio-frame in list order */
 	for (le = src->filtl.head; le; le = le->next) {
-		struct aufilt_enc_st * st = le->data;
-
+		struct aufilt_enc_st *st = le->data;
 		if (st->af && st->af->ench)
 			err |= st->af->ench(st, &af);
 	}
 
 	if (err)
-		warning("multicast source: aufilter encode (%m)\n", err);
+		warning ("mcsource: aufilter encoding error %m\n", err);
 
-	encode_rtp_send(src, af.sampv, af.sampc);
+	encode_rtp_send(src, &af);
 }
 
 
@@ -272,7 +364,6 @@ static void ausrc_error_handler(int err, const char *str, void *arg)
 static void ausrc_read_handler(struct auframe *af, void *arg)
 {
 	struct mcsource *src = arg;
-	size_t num_bytes = auframe_size(af);
 
 	if (src->src_fmt != af->fmt) {
 		warning ("multicast source: ausrc format mismatch: "
@@ -282,7 +373,7 @@ static void ausrc_read_handler(struct auframe *af, void *arg)
 		return;
 	}
 
-	(void) aubuf_write(src->aubuf, af->sampv, num_bytes);
+	aubuf_write_auframe(src->aubuf, af);
 	src->aubuf_started = true;
 
 	if (src->cfg->txmode == AUDIO_MODE_POLL) {
@@ -366,7 +457,7 @@ static int start_source(struct mcsource *src)
 		channels_dsp = src->cfg->channels_src;
 	}
 
-	if (resamp && src->sampv_rs) {
+	if (resamp && !src->sampv_rs) {
 		src->sampv_rs = mem_zalloc(
 			AUDIO_SAMPSZ * sizeof(int16_t), NULL);
 		if (!src->sampv_rs)
@@ -375,8 +466,8 @@ static int start_source(struct mcsource *src)
 		err = auresamp_setup(&src->resamp, srate_dsp, channels_dsp,
 			src->ac->srate, src->ac->ch);
 		if (err) {
-			warning ("multicast source: could not setup ausrc "
-				"resample (%m)\n", err);
+			warning ("mcsource: could not setup ausrc "
+				"resample %m\n", err);
 			return err;
 		}
 	}
@@ -404,8 +495,8 @@ static int start_source(struct mcsource *src)
 			src->module, &prm, src->device,
 			ausrc_read_handler, ausrc_error_handler, src);
 		if (err) {
-			warning ("multicast source: start_source faild (%s-%s)"
-				" (%m)\n", src->module, src->device, err);
+			warning ("mcsource: start_source faild (%s-%s)"
+				" %m\n", src->module, src->device, err);
 			return err;
 		}
 
@@ -416,7 +507,7 @@ static int start_source(struct mcsource *src)
 				if (!re_atomic_rlx(&src->thr.run)) {
 					re_atomic_rlx_set(&src->thr.run, true);
 					err = thread_create_name(&src->thr.tid,
-						"multicast", tx_thread, src);
+						"mcsource", tx_thread, src);
 					if (err) {
 						re_atomic_rlx_set(
 							&src->thr.run, false);
@@ -426,15 +517,15 @@ static int start_source(struct mcsource *src)
 				break;
 
 			default:
-				warning ("multicast source: tx mode "
+				warning ("mcsrouce: tx mode "
 					"not supported (%d)\n",
 					src->cfg->txmode);
 				return ENOTSUP;
 		}
 
 		src->ausrc_prm = prm;
-		info ("multicast source: source started with sample format "
-			"%s\n", aufmt_name(src->src_fmt));
+		info ("mcsource: source started with sample format %s\n",
+			aufmt_name(src->src_fmt));
 	}
 
 	return err;
@@ -473,9 +564,9 @@ static int aufilt_setup(struct mcsource *src, struct list *aufiltl)
 		if (af->encupdh) {
 			err = af->encupdh(&encst, &ctx, af, &prm, NULL);
 			if (err) {
-				warning("multicast source: erro in encoder"
-					"autio-filter '%s' (%m)\n",
-					af->name, err);
+				warning("mcsource: error in encoder"
+					"audio-filter '%s' %m (%d)\n",
+					af->name, err, err);
 			}
 			else {
 				encst->af = af;
@@ -485,12 +576,56 @@ static int aufilt_setup(struct mcsource *src, struct list *aufiltl)
 		}
 
 		if (err) {
-			warning("multicast source: audio-filter '%s' "
-				"update failed (%m)\n", af->name, err);
+			warning("mcsource: audio-filter '%s' "
+				"update failed %m (%d)\n", af->name, err, err);
 			break;
 		}
 	}
 
+	return err;
+}
+
+
+/**
+ * Setup audio file for streaming
+ *
+ * @param src  Multicast source
+ * @param gong Absolute path to audio file
+ *
+ * @return 0 if success, otherwise errorcode
+ */
+static int aufile_setup(struct mcsource *src, struct pl *gong) {
+	struct aufile *af = NULL;
+	char *path = NULL;
+	int err = 0;
+
+	if (!src || !gong)
+		return EINVAL;
+
+	err = pl_strdup(&path, gong);
+	if (err)
+		return ENOMEM;
+
+
+	err = aufile_open(&af, &src->prm_gong, path, AUFILE_READ);
+	if (err)
+		goto out;
+
+	if (src->prm_gong.srate != src->ausrc_prm.srate &&
+		(src->prm_gong.srate % 8000) != 0) {
+		err = ENOTSUP;
+		warning ("mcsource: file samplerate (%d) not supported %m\n",
+			src->prm_gong.srate, err);
+		goto out;
+	}
+
+out:
+	if (err)
+		mem_deref(af);
+	else
+		src->af_gong = af;
+
+	mem_deref(path);
 	return err;
 }
 
@@ -506,7 +641,7 @@ static int aufilt_setup(struct mcsource *src, struct list *aufiltl)
  * @return 0 if success, otherwise errorcode
  */
 int mcsource_start(struct mcsource **srcp, const struct aucodec *ac,
-	mcsender_send_h *sendh, void *arg)
+	struct pl *gong, mcsender_send_h *sendh, void *arg)
 {
 	int err = 0;
 	struct mcsource *src = NULL;
@@ -551,8 +686,7 @@ int mcsource_start(struct mcsource **srcp, const struct aucodec *ac,
 
 		err = src->ac->encupdh(&src->enc, src->ac, &prm, NULL);
 		if (err) {
-			warning ("multicast source: alloc encoder (%m)\n",
-				err);
+			warning ("mcsender: alloc enc %m (%d)\n", err, err);
 			goto out;
 		}
 	}
@@ -560,6 +694,11 @@ int mcsource_start(struct mcsource **srcp, const struct aucodec *ac,
 	err = aufilt_setup(src, baresip_aufiltl());
 	if (err)
 		goto out;
+
+	err = aufile_setup(src, gong);
+	if (err) {
+		goto out;
+	}
 
 	err = start_source(src);
 	if (err)

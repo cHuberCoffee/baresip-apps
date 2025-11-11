@@ -31,6 +31,8 @@ struct mcsender {
 	struct sa addr;
 	struct rtp_sock *rtp;
 
+	struct pl *gong;
+
 	struct config_audio *cfg;
 	const struct aucodec *ac;
 
@@ -156,7 +158,8 @@ void mcsender_stop(struct sa *addr)
  *
  * @return 0 if success, otherwise errorcode
  */
-int mcsender_alloc(struct sa *addr, const struct aucodec *codec)
+int mcsender_alloc(struct sa *addr, const struct aucodec *codec,
+	struct pl *gong)
 {
 	int err = 0;
 	struct mcsender *mcsender = NULL;
@@ -176,10 +179,13 @@ int mcsender_alloc(struct sa *addr, const struct aucodec *codec)
 	sa_cpy(&mcsender->addr, addr);
 	mcsender->ac = codec;
 	mcsender->enable = true;
+	mcsender->gong = gong;
 
 	err = rtp_open(&mcsender->rtp, sa_af(&mcsender->addr));
-	if (err)
+	if (err) {
+		warning ("mcsender: rtp setup failed %m\n", err);
 		goto out;
+	}
 
 	if (ttl > 1) {
 		struct udp_sock *sock;
@@ -189,11 +195,14 @@ int mcsender_alloc(struct sa *addr, const struct aucodec *codec)
 			IP_MULTICAST_TTL, &ttl, sizeof(ttl));
 	}
 
-	err = mcsource_start(&mcsender->src, mcsender->ac,
+	err = mcsource_start(&mcsender->src, mcsender->ac, mcsender->gong,
 		mcsender_send_handler, mcsender);
+	if (err) {
+		warning ("mcsender: start of mcsource failed %m\n", err);
+		goto out;
+	}
 
 	list_append(&mcsenderl, &mcsender->le, mcsender);
-
  out:
 	if (err)
 		mem_deref(mcsender);

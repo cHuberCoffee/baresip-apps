@@ -119,6 +119,32 @@ static int check_rtp_pt(struct aucodec *ac)
 
 
 /**
+ * Verify path to be a file
+ *
+ * @param plgong Absolute path to an audio file
+ *
+ * @return 0 if success, otherwise errorcode
+ */
+static int verify_gong_path(struct pl *plgong)
+{
+	char *path = NULL;
+	int err = 0;
+	if (!plgong)
+		return EINVAL;
+	err = pl_strdup(&path, plgong);
+	if (err)
+		return err;
+	if (!fs_isfile(path)) {
+		err = ENOENT;
+		goto out;
+	}
+out:
+	mem_deref(path);
+	return err;
+}
+
+
+/**
  * Getter for the call priority
  *
  * @return uint8_t call priority
@@ -175,30 +201,60 @@ static int cmd_mcsend(struct re_printf *pf, void *arg)
 	int err = 0;
 	const struct cmd_arg *carg = arg;
 	struct pl pladdr, plcodec;
+	struct pl plgong = PL_INIT;
 	struct sa addr;
 	struct aucodec *codec = NULL;
 
 	err = re_regex(carg->prm, str_len(carg->prm),
-		"addr=[^ ]* codec=[^ ]*", &pladdr, &plcodec);
-	if (err)
-		goto out;
+		"addr=[^ ]* codec=[^ ]* gong=[^ ]*",
+		&pladdr, &plcodec, &plgong);
+	if (err) {
+		err = re_regex(carg->prm, str_len(carg->prm),
+			"addr=[^ ]* codec=[^ ]*",
+			&pladdr, &plcodec);
+			if (err) {
+				re_hprintf(pf,
+					"usage: /mcsend addr=<IP>:<PORT> "
+					"codec=<CODEC> "
+					"optional(gong=<PATH>)\n");
+				goto out;
+			}
+	}
 
 	err = decode_addr(&pladdr, &addr);
-	err |= decode_codec(&plcodec, &codec);
-	if (err)
+	if (err) {
+		re_hprintf(pf, "provided address not valid %m\n", err);
 		goto out;
+	}
+
+	err = decode_codec(&plcodec, &codec);
+	if (err) {
+		re_hprintf(pf, "provided codec not supported by baresip %m\n",
+			err);
+		goto out;
+	}
 
 	err = check_rtp_pt(codec);
-	if (err)
+	if (err) {
+		re_hprintf(pf, "provided codec not supported by multicast "
+			"%m\n", err);
 		goto out;
+	}
 
-	err = mcsender_alloc(&addr, codec);
+	if (pl_isset(&plgong)) {
+		err = verify_gong_path(&plgong);
+		if (err) {
+			re_hprintf(pf, "provided gong path does not point"
+				"to a file %m\n", err);
+			goto out;
+		}
+	}
+
+	err = mcsender_alloc(&addr, codec, &plgong);
+	if (err)
+		re_hprintf(pf, "multicast sender allocation failed %m", err);
 
   out:
-	if (err)
-		re_hprintf(pf,
-			"usage: /mcsend addr=<IP>:<PORT> codec=<CODEC>\n");
-
 	return err;
 }
 
