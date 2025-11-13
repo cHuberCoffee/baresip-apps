@@ -27,6 +27,7 @@ void multicast_set_dnd(bool v);
 /* Sender */
 typedef int (mcsender_send_h)(size_t ext_len, bool marker, uint32_t rtp_ts,
 	struct mbuf *mb, void *arg);
+typedef int (mcsender_eof_h)(void *arg);
 
 int  mcsender_alloc(struct sa *addr, const struct aucodec *codec);
 void mcsender_stopall(void);
@@ -62,7 +63,8 @@ void mcplayer_terminate(void);
 /* Source <exchangable source> */
 struct mcsource;
 int mcsource_start(struct mcsource **srcp, const struct aucodec *ac,
-	mcsender_send_h *sendh, void *arg);
+		   const char *gong_file, mcsender_send_h *sendh,
+		   mcsender_eof_h *eofh, void *arg);
 void mcsource_stop(struct mcsource *src);
 
 int  mcsource_init(void);

@@ -100,6 +100,12 @@ static int mcsender_send_handler(size_t ext_len, bool marker,
 }
 
 
+static int mcsender_gong_eof_handler(void *arg) {
+	struct mcsender *mcs = arg;
+	(void) arg;
+}
+
+
 /**
  * Enable / Disable all existing sender
  *
@@ -189,8 +195,10 @@ int mcsender_alloc(struct sa *addr, const struct aucodec *codec)
 			IP_MULTICAST_TTL, &ttl, sizeof(ttl));
 	}
 
-	err = mcsource_start(&mcsender->src, mcsender->ac,
-		mcsender_send_handler, mcsender);
+	err = mcsource_start(&mcsender->src, mcsender->ac, "/tmp/path/to/audio_file.wav",
+		mcsender_send_handler, mcsender_gong_eof_handler, mcsender);
+	if (err)
+		goto out;
 
 	list_append(&mcsenderl, &mcsender->le, mcsender);
 
